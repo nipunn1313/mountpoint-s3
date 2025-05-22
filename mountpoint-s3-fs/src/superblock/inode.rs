@@ -418,6 +418,7 @@ impl WriteMode {
 
 #[cfg(test)]
 mod tests {
+    use crate::mountspace::Mountspace;
     use crate::superblock::Superblock;
     use mountpoint_s3_client::{
         mock_client::{MockClient, MockClientConfig, MockObject},
@@ -713,6 +714,7 @@ mod tests {
                     client.clone(),
                     "test_bucket",
                     &Default::default(),
+                    Default::default(),
                     Default::default(),
                 ));
 
