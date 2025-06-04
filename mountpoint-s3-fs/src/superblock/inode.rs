@@ -507,7 +507,7 @@ mod tests {
         let lookup_count = superblock.get_lookup_count(ino);
         assert_eq!(lookup_count, 1);
 
-        superblock.forget(ino, 1);
+        superblock.forget(ino, 1).await;
         // TODO: Find a way to check this
 
         let lookup_count = superblock.get_lookup_count(ino);
@@ -559,7 +559,7 @@ mod tests {
         let new_lookup = superblock.lookup(ROOT_INODE_NO, name.as_ref()).await.unwrap();
         assert_ne!(ino, new_lookup.ino);
 
-        superblock.forget(ino, 1);
+        superblock.forget(ino, 1).await;
 
         // Lookup still works after forgetting the old inode
         let new_lookup2 = superblock.lookup(ROOT_INODE_NO, name.as_ref()).await.unwrap();
@@ -725,7 +725,7 @@ mod tests {
 
                 let superblock_clone = superblock.clone();
                 let forget_task = thread::spawn(move || {
-                    superblock_clone.forget(ino, 1);
+                    block_on(superblock_clone.forget(ino, 1));
                 });
 
                 let file_name = "bar";
