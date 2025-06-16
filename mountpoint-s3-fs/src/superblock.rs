@@ -38,9 +38,8 @@ use crate::fs::DirectoryReplier;
 use crate::fs::{CacheConfig, FUSE_ROOT_INODE};
 use crate::logging;
 #[cfg(feature = "manifest")]
-use crate::manifest::{Manifest, ManifestEntry, ManifestError};
-use crate::mountspace::{self, ReadHandle, WriteHandle};
-use crate::mountspace::{Mountspace, MountspaceDirectoryReplier, S3Location};
+use crate::manifest::ManifestError;
+use crate::mountspace::{self, Mountspace, MountspaceDirectoryReplier, ReadHandle, S3Location, WriteHandle};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -171,8 +170,6 @@ impl<OC: ObjectClient + Send + Sync> fmt::Debug for SuperblockInner<OC> {
 pub struct SuperblockConfig {
     pub cache_config: CacheConfig,
     pub s3_personality: S3Personality,
-    #[cfg(feature = "manifest")]
-    pub manifest: Option<Manifest>,
 }
 
 /// A manager for automatically setting and removing the `PendingRename` write status on an inode.
@@ -1340,13 +1337,6 @@ impl<OC: ObjectClient + Send + Sync> SuperblockInner<OC> {
         let lookup = match lookup {
             Some(lookup) => lookup?,
             None => {
-                #[cfg(feature = "manifest")]
-                let remote = if let Some(manifest) = &self.config.manifest {
-                    self.manifest_lookup(manifest, parent_ino, &name)?
-                } else {
-                    self.remote_lookup(parent_ino, name).await?
-                };
-                #[cfg(not(feature = "manifest"))]
                 let remote = self.remote_lookup(parent_ino, name).await?;
                 self.update_from_remote(parent_ino, name, remote)?
             }
@@ -1401,46 +1391,6 @@ impl<OC: ObjectClient + Send + Sync> SuperblockInner<OC> {
         metrics::counter!("metadata_cache.cache_hit").increment(lookup.is_some().into());
 
         lookup
-    }
-
-    /// Lookup in the [Manifest] and convert the entry to [RemoteLookup]
-    #[cfg(feature = "manifest")]
-    fn manifest_lookup(
-        &self,
-        manifest: &Manifest,
-        parent_ino: InodeNo,
-        name: &str,
-    ) -> Result<Option<RemoteLookup>, InodeError> {
-        let parent = self.get(parent_ino)?;
-        if parent.kind() != InodeKind::Directory {
-            return Err(InodeError::NotADirectory(parent.err()));
-        }
-
-        let parent_full_path = self.full_key_for_inode(&parent);
-        let Some(manifest_entry) = manifest.manifest_lookup(parent_full_path.to_string(), name)? else {
-            return Ok(None);
-        };
-
-        let remote_lookup = match manifest_entry {
-            ManifestEntry::File { etag, size, .. } => RemoteLookup {
-                kind: InodeKind::File,
-                stat: InodeStat::for_file(
-                    size,
-                    self.mount_time,
-                    Some(etag.as_str().into()),
-                    // Intentionally leaving `storage_class` and `restore_status` empty,
-                    // which may result in EIO errors on read for GLACIER | DEEP_ARCHIVE objects
-                    None,
-                    None,
-                    self.config.cache_config.file_ttl,
-                ),
-            },
-            ManifestEntry::Directory { .. } => RemoteLookup {
-                kind: InodeKind::Directory,
-                stat: InodeStat::for_directory(self.mount_time, self.config.cache_config.dir_ttl),
-            },
-        };
-        Ok(Some(remote_lookup))
     }
 
     /// Lookup an inode in the parent directory with the given name
@@ -2192,7 +2142,6 @@ mod tests {
             SuperblockConfig {
                 cache_config: CacheConfig::new(TimeToLive::Duration(ttl)),
                 s3_personality: S3Personality::Standard,
-                ..Default::default()
             },
             Default::default(),
         );
@@ -2245,7 +2194,6 @@ mod tests {
             SuperblockConfig {
                 cache_config: CacheConfig::new(TimeToLive::Duration(ttl)),
                 s3_personality: S3Personality::Standard,
-                ..Default::default()
             },
             Default::default(),
         );
