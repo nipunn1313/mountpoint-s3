@@ -111,6 +111,7 @@ struct SuperblockInner {
     bucket: String,
     prefix: Prefix,
     inodes: RwLock<InodeMap>,
+    // Number of active prefetching streams on the inode
     reader_count: RwLock<HashMap<InodeNo, u32>>,
     negative_cache: NegativeCache,
     cached_rename_support: RenameCache,
@@ -252,15 +253,13 @@ impl Superblock {
     /// The kernel tells us when it removes a reference to an [InodeNo] from its internal caches via a forget call.
     /// The kernel may forget a number of references (`n`) in one forget message to our FUSE implementation.
     /// If the lookup count reaches zero, it is safe for the [Superblock] to delete the [Inode].
-    pub fn forget(&self, ino: InodeNo, nlookup: u64) {
+    pub fn forget(&self, ino: InodeNo, n: u64) {
         let mut inodes = self.inner.inodes.write().unwrap();
 
         let remove_inode = if let Some((_, lookup_count)) = inodes.get_mut(&ino) {
-            if *lookup_count >= nlookup {
-                *lookup_count -= nlookup;
-            } else {
-                *lookup_count = 0;
-            }
+            debug_assert!(n <= *lookup_count, "lookup count cannot go negative");
+            *lookup_count = lookup_count.saturating_sub(n);
+            trace!(ino = ino, new_lookup_count = lookup_count, "decremented lookup count",);
             *lookup_count == 0
         } else {
             debug_assert!(
