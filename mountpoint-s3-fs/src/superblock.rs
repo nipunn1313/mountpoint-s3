@@ -111,6 +111,7 @@ struct SuperblockInner {
     bucket: String,
     prefix: Prefix,
     inodes: RwLock<InodeMap>,
+    reader_count: RwLock<HashMap<InodeNo, u32>>,
     negative_cache: NegativeCache,
     cached_rename_support: RenameCache,
     next_ino: AtomicU64,
@@ -238,6 +239,7 @@ impl Superblock {
             bucket: bucket.to_owned(),
             prefix: prefix.clone(),
             inodes: RwLock::new(inodes),
+            reader_count: RwLock::new(HashMap::new()),
             negative_cache,
             next_ino: AtomicU64::new(2),
             mount_time,
@@ -424,7 +426,7 @@ impl Superblock {
         trace!(?ino, "read");
 
         let inode = self.inner.get(ino)?;
-        ReadHandle::new(inode)
+        ReadHandle::new(self.inner.clone(), inode)
     }
 
     /// Start a readdir stream for the given directory inode

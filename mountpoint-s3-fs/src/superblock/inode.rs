@@ -529,26 +529,38 @@ impl WriteHandle {
 /// Handle for a file being read
 #[derive(Debug)]
 pub struct ReadHandle {
+    inner: Arc<SuperblockInner>,
     inode: Inode,
 }
 
 impl ReadHandle {
     /// Create a new read handle
-    pub(super) fn new(inode: Inode) -> Result<Self, InodeError> {
-        let mut state = inode.get_mut_inode_state()?;
+    pub(super) fn new(inner: Arc<SuperblockInner>, inode: Inode) -> Result<Self, InodeError> {
+        let ino = inode.ino();
+        let state = inode.get_inode_state()?;
         if !matches!(state.write_status, WriteStatus::Remote | WriteStatus::PendingRename) {
             return Err(InodeError::InodeNotReadableWhileWriting(inode.err()));
         }
-        state.reader_count += 1;
+        {
+            let mut reader_count = inner.reader_count.write().unwrap();
+            let count = reader_count.entry(ino).or_insert(0);
+            *count += 1;
+        }
         drop(state);
-        Ok(Self { inode })
+
+        Ok(Self { inner, inode })
     }
 
     /// Update status of the inode to reflect the read being finished
     pub fn finish(self) -> Result<(), InodeError> {
-        // Decrease reader count for the inode
-        let mut state = self.inode.get_mut_inode_state()?;
-        state.reader_count -= 1;
+        let ino = self.inode.ino();
+        let mut reader_count = self.inner.reader_count.write().unwrap();
+        if let Some(count) = reader_count.get_mut(&ino) {
+            *count -= 1;
+            if *count == 0 {
+                reader_count.remove(&ino);
+            }
+        }
         Ok(())
     }
 }
