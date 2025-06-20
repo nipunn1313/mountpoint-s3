@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 
 use crate::prefix::Prefix;
