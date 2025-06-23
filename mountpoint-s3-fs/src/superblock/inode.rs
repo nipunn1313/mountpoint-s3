@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
-use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 
 use crate::prefix::Prefix;
@@ -462,7 +461,7 @@ mod tests {
         );
         superblock.inner.inodes.write().unwrap().insert(ino, inode.clone(), 5);
 
-        superblock.forget(ino, 3);
+        superblock.forget(ino, 3).await;
         let lookup_count = superblock.get_lookup_count(ino);
         assert_eq!(lookup_count, 2, "lookup should have been reduced");
         assert!(
@@ -470,7 +469,7 @@ mod tests {
             "inode should be present in superblock"
         );
 
-        superblock.forget(ino, 2);
+        superblock.forget(ino, 2).await;
         let lookup_count = superblock.get_lookup_count(ino);
         assert_eq!(lookup_count, 0, "lookup should have been reduced");
         assert!(
@@ -504,7 +503,7 @@ mod tests {
         // TODO: Find a way to check this
 
         let lookup = superblock.lookup(ROOT_INODE_NO, name.as_ref()).await.unwrap();
-        let ino = lookup.inode.ino();
+        let ino = lookup.ino;
         let lookup_count = superblock.get_lookup_count(ino);
         assert_eq!(lookup_count, 1);
 
@@ -720,7 +719,7 @@ mod tests {
                 ));
 
                 let lookup = superblock.lookup(ROOT_INODE_NO, name.as_ref()).await.unwrap();
-                let ino = lookup.inode.ino();
+                let ino = lookup.ino;
                 let lookup_count = superblock.get_lookup_count(ino);
                 assert_eq!(lookup_count, 1);
 
@@ -736,7 +735,7 @@ mod tests {
                     .unwrap();
 
                 forget_task.join().unwrap();
-                let ino = lookup.inode.ino();
+                let ino = lookup.ino;
                 let lookup_count = superblock.get_lookup_count(ino);
                 assert_eq!(lookup_count, 0);
             }
@@ -773,14 +772,15 @@ mod tests {
                     "test_bucket",
                     &Default::default(),
                     Default::default(),
+                    Default::default(),
                 ));
 
                 // Lookup directories to get inodes
                 let dir_lookup = superblock.lookup(ROOT_INODE_NO, dir.as_ref()).await.unwrap();
-                let dir_ino = dir_lookup.inode.ino();
+                let dir_ino = dir_lookup.ino;
 
                 let dirtwo_lookup = superblock.lookup(ROOT_INODE_NO, dirtwo.as_ref()).await.unwrap();
-                let dirtwo_ino = dirtwo_lookup.inode.ino();
+                let dirtwo_ino = dirtwo_lookup.ino;
 
                 // Verify source files exist before rename
                 let source1_lookup = superblock.lookup(dir_ino, source_name.as_ref()).await;
@@ -867,13 +867,14 @@ mod tests {
                     "test_bucket",
                     &Default::default(),
                     Default::default(),
+                    Default::default(),
                 ));
                 // Create two threads, one that renames and one that tries to open the destination
                 let superblock_clone1 = superblock.clone();
                 let dest_lookup = superblock.lookup(ROOT_INODE_NO, dest_name.as_ref()).await.unwrap();
-                let _dest_ino = dest_lookup.inode.ino();
+                let _dest_ino = dest_lookup.ino;
                 let src_lookup = superblock.lookup(ROOT_INODE_NO, source_name.as_ref()).await.unwrap();
-                let _src_ino = src_lookup.inode.ino();
+                let _src_ino = src_lookup.ino;
 
                 let rename_task1 = thread::spawn(move || {
                     block_on(async {
@@ -897,7 +898,7 @@ mod tests {
                             .lookup(ROOT_INODE_NO, dest_name.as_ref())
                             .await
                             .expect("should succeed as object will be in S3");
-                        lookup.inode.ino()
+                        lookup.ino
                     })
                 });
                 let _ = rename_task1.join();

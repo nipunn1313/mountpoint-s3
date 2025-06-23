@@ -323,6 +323,18 @@ impl Mountspace for HyperBlock {
         Err(InodeError::OperationNotPermitted)
     }
 
+    async fn rename(
+        &self,
+        _src_parent_ino: InodeNo,
+        _src_name: &OsStr,
+        _dst_parent_ino: InodeNo,
+        _dst_name: &OsStr,
+        _allow_overwrite: bool,
+    ) -> Result<(), InodeError> {
+        // For a read-only view, don't allow renaming
+        Err(InodeError::OperationNotPermitted)
+    }
+
     async fn setattr(
         &self,
         _ino: InodeNo,
