@@ -12,7 +12,33 @@ use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::AsyncMutex;
 use crate::upload::{AppendUploadRequest, UploadRequest};
 
-use super::{DirectoryEntry, Error, InodeNo, OpenFlags, S3Filesystem, ToErrno};
+use super::{DirectoryEntryInfo, Error, InodeNo, OpenFlags, S3Filesystem, ToErrno};
+use crate::mountspace::AttibuteInformationProvider;
+use crate::superblock::InodeKind;
+use crate::superblock::InodeStat;
+use std::time::Duration;
+
+impl AttibuteInformationProvider for DirectoryEntryInfo {
+    fn kind(&self) -> InodeKind {
+        self.looked_up.kind
+    }
+
+    fn stat(&self) -> &InodeStat {
+        &self.looked_up.stat
+    }
+
+    fn ino(&self) -> InodeNo {
+        self.looked_up.ino
+    }
+
+    fn is_remote(&self) -> bool {
+        self.looked_up.is_remote
+    }
+
+    fn validity(&self) -> Duration {
+        self.looked_up.validity()
+    }
+}
 
 #[derive(Debug)]
 pub struct DirHandle {
@@ -20,7 +46,7 @@ pub struct DirHandle {
     ino: InodeNo,
     pub handle_no: AtomicU64,
     offset: AtomicI64,
-    pub last_response: AsyncMutex<Option<(i64, Vec<DirectoryEntry>)>>,
+    pub last_response: AsyncMutex<Option<(i64, Vec<DirectoryEntryInfo>)>>,
 }
 
 impl DirHandle {

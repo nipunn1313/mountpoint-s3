@@ -1,21 +1,20 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use fuser::FileAttr;
 use mountpoint_s3_client::types::ETag;
 use time::OffsetDateTime;
 
-use crate::fs::{DirectoryEntry, FUSE_ROOT_INODE};
+use crate::fs::FUSE_ROOT_INODE;
 use crate::manifest::manifest_impl::{Manifest, ManifestEntry, ManifestError, ManifestIter};
+use crate::mountspace::AttibuteInformationProvider;
 use crate::mountspace::{LookedUp, Mountspace, MountspaceDirectoryReplier, ReadHandle, S3Location, WriteHandle};
 use crate::prefix::Prefix;
 use crate::superblock::path::{ValidKey, ValidKeyError};
-use crate::superblock::{InodeError, InodeErrorInfo, InodeKind, InodeNo, InodeStat, MakeAttrConfig, WriteMode};
+use crate::superblock::{InodeError, InodeErrorInfo, InodeKind, InodeNo, InodeStat, WriteMode};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex, RwLock};
-
 // 200 years seems long enough
 const NEVER_EXPIRE_TTL: Duration = Duration::from_secs(200 * 365 * 24 * 60 * 60);
 
@@ -27,7 +26,6 @@ pub struct ChannelConfig {
 
 #[derive(Debug)]
 pub struct HyperBlock {
-    make_attr_config: MakeAttrConfig,
     channels: Vec<ChannelConfig>,
     mount_time: OffsetDateTime,
     manifest: Manifest,
@@ -36,9 +34,8 @@ pub struct HyperBlock {
 }
 
 impl HyperBlock {
-    pub fn new(make_attr_config: MakeAttrConfig, manifest: Manifest, channels: Vec<ChannelConfig>) -> Self {
+    pub fn new(manifest: Manifest, channels: Vec<ChannelConfig>) -> Self {
         Self {
-            make_attr_config,
             channels,
             mount_time: OffsetDateTime::now_utc(),
             manifest,
@@ -109,40 +106,36 @@ impl HyperBlock {
             ManifestEntry::Directory { parent_id, .. } => Ok(parent_id),
         }
     }
+}
 
-    fn make_attr(&self, ino: InodeNo, kind: InodeKind, size: u64) -> FileAttr {
-        /// From man stat(2): `st_blocks`: "This field indicates the number of blocks allocated to
-        /// the file, in 512-byte units."
-        const STAT_BLOCK_SIZE: u64 = 512;
-        /// From man stat(2): `st_blksize`: "This field gives the "preferred" block size for
-        /// efficient filesystem I/O."
-        const PREFERRED_IO_BLOCK_SIZE: u32 = 4096;
+struct ManifestEntryInfo {
+    ino: InodeNo,
+    name: OsString,
+    offset: i64,
+    generation: u64,
+    stat: InodeStat,
+    kind: InodeKind,
+}
 
-        // We don't implement hard links, and don't want to have to list a directory to count its
-        // hard links, so we just assume one link for files (itself) and two links for directories
-        // (itself + the "." link).
-        let (perm, nlink) = match kind {
-            InodeKind::File => (self.make_attr_config.file_mode, 1),
-            InodeKind::Directory => (self.make_attr_config.dir_mode, 2),
-        };
+impl AttibuteInformationProvider for ManifestEntryInfo {
+    fn kind(&self) -> InodeKind {
+        self.kind
+    }
 
-        FileAttr {
-            ino,
-            size,
-            blocks: size.div_ceil(STAT_BLOCK_SIZE),
-            atime: self.mount_time.into(),
-            mtime: self.mount_time.into(),
-            ctime: self.mount_time.into(),
-            crtime: UNIX_EPOCH,
-            kind: kind.into(),
-            perm,
-            nlink,
-            uid: self.make_attr_config.uid,
-            gid: self.make_attr_config.gid,
-            rdev: 0,
-            flags: 0,
-            blksize: PREFERRED_IO_BLOCK_SIZE,
-        }
+    fn stat(&self) -> &InodeStat {
+        &self.stat
+    }
+
+    fn ino(&self) -> InodeNo {
+        self.ino
+    }
+
+    fn is_remote(&self) -> bool {
+        true // All manifest entries are remote
+    }
+
+    fn validity(&self) -> Duration {
+        NEVER_EXPIRE_TTL
     }
 }
 
@@ -206,16 +199,15 @@ impl Mountspace for HyperBlock {
     ) -> Result<(), InodeError> {
         // serve '.' and '..' entries
         if offset < 1 {
-            let attr = self.make_attr(parent, InodeKind::Directory, 0);
-            let entry = DirectoryEntry {
+            let entry = ManifestEntryInfo {
                 ino: parent,
-                offset: offset + 1, // start with 1
                 name: ".".into(),
-                attr,
+                offset: offset + 1,
                 generation: 0,
-                ttl: NEVER_EXPIRE_TTL,
+                stat: InodeStat::for_directory(self.mount_time, NEVER_EXPIRE_TTL),
+                kind: InodeKind::Directory,
             };
-            if reply.add(entry) {
+            if !reply.add(&entry, &entry.name, entry.offset, entry.generation) {
                 return Ok(());
             }
             offset += 1;
@@ -223,16 +215,15 @@ impl Mountspace for HyperBlock {
 
         if offset < 2 {
             let grandparent_ino = self.get_parent_id(parent)?;
-            let attr = self.make_attr(grandparent_ino, InodeKind::Directory, 0);
-            let entry = DirectoryEntry {
+            let entry = ManifestEntryInfo {
                 ino: grandparent_ino,
-                offset: offset + 1,
                 name: "..".into(),
-                attr,
+                offset: offset + 1,
                 generation: 0,
-                ttl: NEVER_EXPIRE_TTL,
+                stat: InodeStat::for_directory(self.mount_time, NEVER_EXPIRE_TTL),
+                kind: InodeKind::Directory,
             };
-            if reply.add(entry) {
+            if !reply.add(&entry, &entry.name, entry.offset, entry.generation) {
                 return Ok(());
             }
             offset += 1;
@@ -254,19 +245,42 @@ impl Mountspace for HyperBlock {
             let Some(manifest_entry) = readdir_handle.next_entry()? else {
                 break;
             };
-            let (ino, full_key, size, kind) = match manifest_entry.clone() {
-                ManifestEntry::File { id, full_key, size, .. } => (id, full_key, size, InodeKind::File),
-                ManifestEntry::Directory { id, full_key, .. } => (id, full_key, 0, InodeKind::Directory),
+            let (ino, name, stat, kind) = match &manifest_entry {
+                ManifestEntry::File {
+                    id,
+                    full_key,
+                    size,
+                    etag,
+                    ..
+                } => {
+                    let name = OsString::from(full_key.rsplit('/').next().unwrap());
+                    let stat = InodeStat::for_file(
+                        *size,
+                        self.mount_time,
+                        Some(etag.as_str().into()),
+                        None,
+                        None,
+                        NEVER_EXPIRE_TTL,
+                    );
+                    (*id, name, stat, InodeKind::File)
+                }
+                ManifestEntry::Directory { id, full_key, .. } => {
+                    let name = OsString::from(full_key.rsplit('/').next().unwrap());
+                    let stat = InodeStat::for_directory(self.mount_time, NEVER_EXPIRE_TTL);
+                    (*id, name, stat, InodeKind::Directory)
+                }
             };
-            let readdir_entry = DirectoryEntry {
+
+            let entry = ManifestEntryInfo {
                 ino,
+                name,
                 offset: offset + 1,
-                name: OsString::from(full_key.rsplit("/").next().unwrap()),
-                attr: self.make_attr(ino, kind, size as u64),
                 generation: 0,
-                ttl: NEVER_EXPIRE_TTL,
+                stat,
+                kind,
             };
-            if reply.add(readdir_entry) {
+
+            if !reply.add(&entry, &entry.name, entry.offset, entry.generation) {
                 readdir_handle.readd(manifest_entry);
                 break;
             }

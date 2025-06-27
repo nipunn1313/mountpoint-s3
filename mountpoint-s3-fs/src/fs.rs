@@ -18,11 +18,11 @@ use mountpoint_s3_client::ObjectClient;
 use crate::async_util::Runtime;
 use crate::logging;
 use crate::mem_limiter::MemoryLimiter;
+use crate::mountspace::AttibuteInformationProvider;
 use crate::mountspace::LookedUp;
 use crate::mountspace::Mountspace;
 use crate::prefetch::{Prefetcher, PrefetcherBuilder};
 use crate::prefix::Prefix;
-use crate::superblock::MakeAttrConfig;
 use crate::superblock::{InodeError, InodeKind, Superblock, SuperblockConfig};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, AsyncMutex, AsyncRwLock};
@@ -107,6 +107,14 @@ pub struct DirectoryEntry {
     pub ttl: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct DirectoryEntryInfo {
+    pub looked_up: LookedUp,
+    pub name: OsString,
+    pub offset: i64,
+    pub generation: u64,
+}
+
 /// Reply to a 'statfs' call
 #[derive(Debug)]
 pub struct StatFs {
@@ -162,12 +170,6 @@ where
             cache_config: config.cache_config.clone(),
             s3_personality: config.s3_personality,
         };
-        let make_attr_config = MakeAttrConfig {
-            uid: config.uid,
-            gid: config.gid,
-            file_mode: config.file_mode,
-            dir_mode: config.dir_mode,
-        };
 
         #[cfg(feature = "manifest")]
         let superblock: Arc<dyn Mountspace> = if let Some(manifest) = config.manifest.as_ref() {
@@ -175,28 +177,12 @@ where
                 bucket_name: bucket.to_string(),
                 prefix: prefix.clone(),
             }];
-            Arc::new(crate::manifest::HyperBlock::new(
-                make_attr_config,
-                manifest.clone(),
-                channels,
-            ))
+            Arc::new(crate::manifest::HyperBlock::new(manifest.clone(), channels))
         } else {
-            Arc::new(Superblock::new(
-                client.clone(),
-                bucket,
-                prefix,
-                superblock_config,
-                make_attr_config,
-            ))
+            Arc::new(Superblock::new(client.clone(), bucket, prefix, superblock_config))
         };
         #[cfg(not(feature = "manifest"))]
-        let superblock = Arc::new(Superblock::new(
-            client.clone(),
-            bucket,
-            prefix,
-            superblock_config,
-            make_attr_config,
-        ));
+        let superblock = Arc::new(Superblock::new(client.clone(), bucket, prefix, superblock_config));
 
         let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), config.mem_limit));
         let prefetcher = prefetch_builder.build(runtime.clone(), mem_limiter.clone(), config.prefetcher_config);
@@ -288,6 +274,41 @@ where
                 .expect("The host must support FUSE_ATOMIC_O_TRUNC capability in order to allow overwrites");
         }
         Ok(())
+    }
+    /// Generic version that works with any AttibuteInformationProvider
+    fn make_attr_from_provider(&self, provider: &dyn AttibuteInformationProvider) -> FileAttr {
+        const STAT_BLOCK_SIZE: u64 = 512;
+        const PREFERRED_IO_BLOCK_SIZE: u32 = 4096;
+
+        let stat = provider.stat();
+        let (perm, nlink) = match provider.kind() {
+            InodeKind::File => {
+                if stat.is_readable {
+                    (self.config.file_mode, 1)
+                } else {
+                    (0o000, 1)
+                }
+            }
+            InodeKind::Directory => (self.config.dir_mode, 2),
+        };
+
+        FileAttr {
+            ino: provider.ino(),
+            size: stat.size as u64,
+            blocks: (stat.size as u64).div_ceil(STAT_BLOCK_SIZE),
+            atime: stat.atime.into(),
+            mtime: stat.mtime.into(),
+            ctime: stat.ctime.into(),
+            crtime: UNIX_EPOCH,
+            kind: provider.kind().into(),
+            perm,
+            nlink,
+            uid: self.config.uid,
+            gid: self.config.gid,
+            rdev: 0,
+            flags: 0,
+            blksize: PREFERRED_IO_BLOCK_SIZE,
+        }
     }
 
     fn make_attr(&self, lookup: &LookedUp) -> FileAttr {
@@ -624,9 +645,13 @@ where
             .unwrap()
             .handle_no
             .load(Ordering::Relaxed);
-        self.superblock
-            .readdir(parent, num, offset, false, MountspaceDirectoryReplier::new(&mut reply))
-            .await?;
+
+        //
+        let attr_creator = |provider: &dyn AttibuteInformationProvider| self.make_attr_from_provider(provider);
+
+        let replier = MountspaceDirectoryReplier::new(&mut reply, &attr_creator);
+
+        self.superblock.readdir(parent, num, offset, false, replier).await?;
 
         Ok(())
     }
@@ -648,10 +673,11 @@ where
             .unwrap()
             .handle_no
             .load(Ordering::Relaxed);
+        let attr_creator = |provider: &dyn AttibuteInformationProvider| self.make_attr_from_provider(provider);
 
-        self.superblock
-            .readdir(parent, num, offset, true, MountspaceDirectoryReplier::new(&mut reply))
-            .await?;
+        let replier = MountspaceDirectoryReplier::new(&mut reply, &attr_creator);
+
+        self.superblock.readdir(parent, num, offset, true, replier).await?;
         Ok(())
     }
 
