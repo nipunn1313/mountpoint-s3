@@ -9,7 +9,6 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tracing::{debug, trace, Level};
 
-use crate::mountspace::MountspaceDirectoryReplier;
 use fuser::consts::FOPEN_DIRECT_IO;
 use fuser::{FileAttr, KernelConfig};
 use mountpoint_s3_client::types::ChecksumAlgorithm;
@@ -18,9 +17,10 @@ use mountpoint_s3_client::ObjectClient;
 use crate::async_util::Runtime;
 use crate::logging;
 use crate::mem_limiter::MemoryLimiter;
-use crate::mountspace::AttibuteInformationProvider;
+use crate::mountspace::InodeInformation;
 use crate::mountspace::LookedUp;
 use crate::mountspace::Mountspace;
+use crate::mountspace::ReaddirCallback;
 use crate::prefetch::{Prefetcher, PrefetcherBuilder};
 use crate::prefix::Prefix;
 use crate::superblock::{InodeError, InodeKind, Superblock, SuperblockConfig};
@@ -113,6 +113,18 @@ pub struct DirectoryEntryInfo {
     pub name: OsString,
     pub offset: i64,
     pub generation: u64,
+}
+
+impl Into<InodeInformation> for DirectoryEntryInfo {
+    fn into(self) -> InodeInformation {
+        InodeInformation {
+            kind: self.looked_up.kind,
+            stat: self.looked_up.stat.clone(),
+            ino: self.looked_up.ino,
+            is_remote: self.looked_up.is_remote,
+            validity: self.looked_up.validity(),
+        }
+    }
 }
 
 /// Reply to a 'statfs' call
@@ -276,12 +288,12 @@ where
         Ok(())
     }
     /// Generic version that works with any AttibuteInformationProvider
-    fn make_attr_from_provider(&self, provider: &dyn AttibuteInformationProvider) -> FileAttr {
+    fn make_attr_from_provider(&self, provider: &InodeInformation) -> FileAttr {
         const STAT_BLOCK_SIZE: u64 = 512;
         const PREFERRED_IO_BLOCK_SIZE: u32 = 4096;
 
-        let stat = provider.stat();
-        let (perm, nlink) = match provider.kind() {
+        let stat = &provider.stat;
+        let (perm, nlink) = match provider.kind {
             InodeKind::File => {
                 if stat.is_readable {
                     (self.config.file_mode, 1)
@@ -293,14 +305,14 @@ where
         };
 
         FileAttr {
-            ino: provider.ino(),
+            ino: provider.ino,
             size: stat.size as u64,
             blocks: (stat.size as u64).div_ceil(STAT_BLOCK_SIZE),
             atime: stat.atime.into(),
             mtime: stat.mtime.into(),
             ctime: stat.ctime.into(),
             crtime: UNIX_EPOCH,
-            kind: provider.kind().into(),
+            kind: provider.kind.into(),
             perm,
             nlink,
             uid: self.config.uid,
@@ -647,9 +659,20 @@ where
             .load(Ordering::Relaxed);
 
         //
-        let attr_creator = |provider: &dyn AttibuteInformationProvider| self.make_attr_from_provider(provider);
 
-        let replier = MountspaceDirectoryReplier::new(&mut reply, &attr_creator);
+        let replier: ReaddirCallback = Box::new(
+            |information: InodeInformation, name: &OsStr, offset: i64, generation: u64| {
+                // Your logic here
+                reply.add(DirectoryEntry {
+                    ino: information.ino,
+                    offset,
+                    name: name.into(),
+                    attr: self.make_attr_from_provider(&information),
+                    generation,
+                    ttl: information.validity,
+                })
+            },
+        );
 
         self.superblock.readdir(parent, num, offset, false, replier).await?;
 
@@ -673,9 +696,20 @@ where
             .unwrap()
             .handle_no
             .load(Ordering::Relaxed);
-        let attr_creator = |provider: &dyn AttibuteInformationProvider| self.make_attr_from_provider(provider);
 
-        let replier = MountspaceDirectoryReplier::new(&mut reply, &attr_creator);
+        let replier: ReaddirCallback = Box::new(
+            move |information: InodeInformation, name: &OsStr, offset: i64, generation: u64| {
+                // Your logic here
+                reply.add(DirectoryEntry {
+                    ino: information.ino,
+                    offset,
+                    name: name.into(),
+                    attr: self.make_attr_from_provider(&information),
+                    generation,
+                    ttl: information.validity,
+                })
+            },
+        );
 
         self.superblock.readdir(parent, num, offset, true, replier).await?;
         Ok(())

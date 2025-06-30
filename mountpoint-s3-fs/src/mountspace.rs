@@ -1,5 +1,3 @@
-use crate::fs::DirectoryEntry;
-use crate::fs::DirectoryReplier;
 use crate::superblock::path::ValidKey;
 use crate::superblock::InodeError;
 use crate::superblock::InodeKind;
@@ -7,60 +5,21 @@ use crate::superblock::InodeNo;
 use crate::superblock::InodeStat;
 use crate::superblock::WriteMode;
 use async_trait::async_trait;
-use fuser::FileAttr;
+use derive_more::Constructor;
+use getset::Getters;
 use mountpoint_s3_client::types::ETag;
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tracing::debug;
 
-pub trait AttibuteInformationProvider {
-    fn kind(&self) -> InodeKind;
-    fn stat(&self) -> &InodeStat;
-    fn ino(&self) -> InodeNo;
-    fn is_remote(&self) -> bool;
-    fn validity(&self) -> Duration;
-}
-
-pub struct MetaBlockDirectoryEntryInformation {}
-
-pub struct MountspaceDirectoryReplier<'a> {
-    reply: &'a mut (dyn DirectoryReplier + Send + Sync),
-    file_attr_creator: &'a (dyn Fn(&dyn AttibuteInformationProvider) -> FileAttr + Send + Sync),
-}
-
-impl<'a> MountspaceDirectoryReplier<'a> {
-    pub fn new<R: DirectoryReplier + 'a + Send + Sync>(
-        reply: &'a mut R,
-        file_attr_creator: &'a (dyn Fn(&dyn AttibuteInformationProvider) -> FileAttr + Send + Sync),
-    ) -> Self {
-        MountspaceDirectoryReplier {
-            reply,
-            file_attr_creator,
-        }
-    }
-
-    pub fn add(
-        &mut self,
-        file_attributes: &dyn AttibuteInformationProvider,
-        name: &OsStr,
-        offset: i64,
-        generation: u64,
-    ) -> bool {
-        let attr = (self.file_attr_creator)(file_attributes);
-        debug!("made attr");
-        let result = self.reply.add(DirectoryEntry {
-            ino: file_attributes.ino(),
-            offset,
-            name: name.to_os_string(),
-            attr,
-            generation,
-            ttl: file_attributes.validity(),
-        });
-        debug!("{result} in mountspace");
-        result
-    }
+#[derive(Getters, Constructor)]
+pub struct InodeInformation {
+    pub kind: InodeKind,
+    pub stat: InodeStat,
+    pub ino: InodeNo,
+    pub is_remote: bool,
+    pub validity: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +70,9 @@ pub struct WriteHandle {
     pub ino: InodeNo,
 }
 
+// A ReaddirCallback takes an InodeEntry, name, offset, generation id,
+pub type ReaddirCallback<'r> = Box<dyn for<'a> FnMut(InodeInformation, &'a OsStr, i64, u64) -> bool + Send + Sync + 'r>;
+
 #[async_trait]
 pub trait Mountspace: Send + Sync + Debug {
     async fn lookup(&self, parent_ino: InodeNo, name: &OsStr) -> Result<LookedUp, InodeError>;
@@ -147,7 +109,7 @@ pub trait Mountspace: Send + Sync + Debug {
         fh: u64,
         offset: i64,
         is_readdirplus: bool,
-        reply: MountspaceDirectoryReplier<'a>,
+        mut replier: ReaddirCallback<'a>,
     ) -> Result<(), InodeError>;
 
     async fn rename(

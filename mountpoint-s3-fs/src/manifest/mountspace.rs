@@ -8,8 +8,7 @@ use time::OffsetDateTime;
 
 use crate::fs::FUSE_ROOT_INODE;
 use crate::manifest::manifest_impl::{Manifest, ManifestEntry, ManifestError, ManifestIter};
-use crate::mountspace::AttibuteInformationProvider;
-use crate::mountspace::{LookedUp, Mountspace, MountspaceDirectoryReplier, ReadHandle, S3Location, WriteHandle};
+use crate::mountspace::{LookedUp, Mountspace, ReadHandle, ReaddirCallback, S3Location, WriteHandle};
 use crate::prefix::Prefix;
 use crate::superblock::path::{ValidKey, ValidKeyError};
 use crate::superblock::{InodeError, InodeErrorInfo, InodeKind, InodeNo, InodeStat, WriteMode};
@@ -117,28 +116,6 @@ struct ManifestEntryInfo {
     kind: InodeKind,
 }
 
-impl AttibuteInformationProvider for ManifestEntryInfo {
-    fn kind(&self) -> InodeKind {
-        self.kind
-    }
-
-    fn stat(&self) -> &InodeStat {
-        &self.stat
-    }
-
-    fn ino(&self) -> InodeNo {
-        self.ino
-    }
-
-    fn is_remote(&self) -> bool {
-        true // All manifest entries are remote
-    }
-
-    fn validity(&self) -> Duration {
-        NEVER_EXPIRE_TTL
-    }
-}
-
 #[async_trait]
 impl Mountspace for HyperBlock {
     async fn lookup(&self, parent_ino: InodeNo, name: &OsStr) -> Result<LookedUp, InodeError> {
@@ -195,7 +172,7 @@ impl Mountspace for HyperBlock {
         fh: u64,
         mut offset: i64,
         _is_readdirplus: bool,
-        mut reply: MountspaceDirectoryReplier<'a>,
+        mut reply: ReaddirCallback<'a>,
     ) -> Result<(), InodeError> {
         // serve '.' and '..' entries
         if offset < 1 {
@@ -207,7 +184,7 @@ impl Mountspace for HyperBlock {
                 stat: InodeStat::for_directory(self.mount_time, NEVER_EXPIRE_TTL),
                 kind: InodeKind::Directory,
             };
-            if !reply.add(&entry, &entry.name, entry.offset, entry.generation) {
+            if !reply(&entry, &entry.name, entry.offset, entry.generation) {
                 return Ok(());
             }
             offset += 1;
@@ -223,7 +200,7 @@ impl Mountspace for HyperBlock {
                 stat: InodeStat::for_directory(self.mount_time, NEVER_EXPIRE_TTL),
                 kind: InodeKind::Directory,
             };
-            if !reply.add(&entry, &entry.name, entry.offset, entry.generation) {
+            if !reply(&entry, &entry.name, entry.offset, entry.generation) {
                 return Ok(());
             }
             offset += 1;
@@ -280,7 +257,7 @@ impl Mountspace for HyperBlock {
                 kind,
             };
 
-            if !reply.add(&entry, &entry.name, entry.offset, entry.generation) {
+            if !reply(entry.into(), &entry.name, entry.offset, entry.generation) {
                 readdir_handle.readd(manifest_entry);
                 break;
             }

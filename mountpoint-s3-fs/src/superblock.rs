@@ -37,8 +37,8 @@ use crate::fs::{CacheConfig, FUSE_ROOT_INODE};
 use crate::logging;
 #[cfg(feature = "manifest")]
 use crate::manifest::ManifestError;
-use crate::mountspace::AttibuteInformationProvider;
-use crate::mountspace::{self, Mountspace, MountspaceDirectoryReplier, ReadHandle, S3Location, WriteHandle};
+use crate::mountspace::ReaddirCallback;
+use crate::mountspace::{self, Mountspace, ReadHandle, S3Location, WriteHandle};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -654,7 +654,7 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
         fh: u64,
         offset: i64,
         is_readdirplus: bool,
-        mut reply: MountspaceDirectoryReplier<'a>,
+        mut reply: ReaddirCallback<'a>,
     ) -> Result<(), InodeError> {
         trace!("Readdir in suoerblock with {fh} offset: {offset}");
         let dir_handle = {
@@ -692,13 +692,13 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
                 if (last_offset..last_offset + entries.len()).contains(&offset) {
                     trace!(offset, "repeating readdir response");
                     for entry in entries[offset - last_offset..].iter() {
-                        if reply.add(entry, &entry.name, entry.offset, entry.generation) {
+                        if (reply)(entry.clone().into(), &entry.name, entry.offset, entry.generation) {
                             break;
                         } // We are returning this result a second time, so the contract is that we
                           // must remember it again, except that readdirplus specifies that . and ..
                           // are never incremented.
                         if is_readdirplus && entry.name != "." && entry.name != ".." {
-                            self.remember_from_handle(readdir_handle, entry.ino());
+                            self.remember_from_handle(readdir_handle, entry.looked_up.ino);
                             //readdir_handle.remember(&entry.lookup);
                         }
                     }
@@ -717,32 +717,37 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
                 actual: offset,
                 fh,
             });
-            //unreachable!("This should not be reached");
         }
 
         // Wrap a replier to duplicate the entries and store them in `dir_handle.last_response` so
         /// we can re-use them if the directory handle rewinds
-        struct Reply<'a> {
-            reply: MountspaceDirectoryReplier<'a>,
+        struct Reply<'a, 'b> {
+            reply: &'b mut ReaddirCallback<'a>,
             entries: Vec<DirectoryEntryInfo>,
         }
 
-        impl Reply<'_> {
+        impl Reply<'_, '_> {
             async fn finish(self, offset: i64, dir_handle: &DirHandle) {
                 *dir_handle.last_response.lock().await = Some((offset, self.entries));
             }
 
             fn add(&mut self, entry_info: DirectoryEntryInfo) -> bool {
-                let result = self
-                    .reply
-                    .add(&entry_info, &entry_info.name, entry_info.offset, entry_info.generation);
+                let result = (self.reply)(
+                    entry_info.clone().into(),
+                    &entry_info.name,
+                    entry_info.offset,
+                    entry_info.generation,
+                );
                 if !result {
                     self.entries.push(entry_info);
                 }
                 result
             }
         }
-        let mut reply = Reply { reply, entries: vec![] };
+        let mut reply = Reply {
+            reply: &mut reply,
+            entries: vec![],
+        };
 
         if dir_handle.offset() < 1 {
             let lookup = self.getattr(parent, false).await?;
