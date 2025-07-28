@@ -25,5 +25,6 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
+          platforms: linux/arm64
           push: true
           tags: ghcr.io/nipunn1313/aws-mountpoint:latest
